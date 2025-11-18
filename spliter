@@ -6,7 +6,7 @@ import shutil
 
 from tqdm import tqdm
 
-# Opening tag can be anywhere in the line, e.g.
+# Opening tag can be anywhere in a line, e.g.
 #   <tbody_1>
 #   ... <tbody_1.1> ...
 TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
@@ -17,45 +17,55 @@ def split_by_tbody(text: str):
     Return (header, [tbody_block1, tbody_block2, ...]).
 
     - 'header' is everything before the first <tbody_…> tag.
-    - Each tbody_block starts at its own <tbody_X> (inclusive) and
-      ends at the matching </tbody_X> (inclusive). If the closing tag
-      is missing, it goes up to the next <tbody_…> or EOF.
+    - We detect ALL <tbody_X>…</tbody_X> ranges.
+    - We then keep only the *leaf* ranges, i.e. those that do not
+      contain another <tbody_…> start inside them.
+    - Each returned block starts at its own <tbody_X> and ends at its
+      own </tbody_X>, inclusive.
 
     If no tbody tag is found, returns (None, None).
     """
-    matches = list(TBODY_OPEN_RE.finditer(text))
-    if not matches:
+    open_matches = list(TBODY_OPEN_RE.finditer(text))
+    if not open_matches:
         return None, None
 
-    header = text[:matches[0].start()]
-    blocks = []
+    header = text[:open_matches[0].start()]
 
-    for i, m in enumerate(matches):
-        tbody_id = m.group(1)  # e.g. "1", "1.1", "1.1.1"
+    # First, build all blocks (they may be nested / overlapping)
+    blocks = []  # each: dict(id, start, end)
+    for m in open_matches:
+        tbody_id = m.group(1)          # e.g. "1", "1.1", "1.1.1"
         start = m.start()
 
-        # matching closing tag: </tbody_1.1.1>
+        # Find matching closing tag: </tbody_X>
         close_pat = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
                                re.IGNORECASE)
         close_match = close_pat.search(text, m.end())
-
         if close_match:
             end = close_match.end()
         else:
-            # no closing tag: go until next opening tag or EOF
-            if i + 1 < len(matches):
-                end = matches[i + 1].start()
-            else:
-                end = len(text)
+            # If no closing tag is found, go to EOF
+            end = len(text)
 
-        blocks.append(text[start:end])
+        blocks.append({"id": tbody_id, "start": start, "end": end})
 
-    # Attach any trailing text after the last tbody block
-    last_end = end
-    if last_end < len(text):
-        blocks[-1] += text[last_end:]
+    # Keep only leaf blocks (no other block starts inside them)
+    leaf_blocks = []
+    for i, b in enumerate(blocks):
+        has_child = any(
+            j != i and blocks[j]["start"] > b["start"] and blocks[j]["start"] < b["end"]
+            for j in range(len(blocks))
+        )
+        if not has_child:
+            leaf_blocks.append(b)
 
-    return header, blocks
+    # Sort by position in file
+    leaf_blocks.sort(key=lambda b: b["start"])
+
+    # Convert to text slices
+    block_texts = [text[b["start"]:b["end"]] for b in leaf_blocks]
+
+    return header, block_texts
 
 
 def process_file(src_path: Path, dst_dir: Path) -> None:
@@ -79,8 +89,8 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Split .txt files on <tbody_X>...</tbody_X> blocks "
-                    "or copy unchanged."
+        description="Split .txt files so each output has exactly one "
+                    "<tbody_X>...</tbody_X> block."
     )
     parser.add_argument("input_dir", help="Folder containing .txt files")
     parser.add_argument("output_dir", help="Folder for output files")
