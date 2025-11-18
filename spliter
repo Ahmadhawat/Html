@@ -6,26 +6,22 @@ import shutil
 
 from tqdm import tqdm
 
-# Match lines like:
-#   tbody_1
+# Opening tag can be anywhere in the line, e.g.
 #   <tbody_1>
-#   tbody_1.1
-#   <tbody_1.1>
-# with arbitrary spaces/tabs around them.
-TBODY_OPEN_RE = re.compile(
-    r"(?mi)^[^\S\r\n]*<?tbody_([0-9.]+)>?[^\S\r\n]*$"
-)
+#   ... <tbody_1.1> ...
+TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
 
 
 def split_by_tbody(text: str):
     """
     Return (header, [tbody_block1, tbody_block2, ...]).
 
-    - 'header' is everything before the first tbody line.
-    - Each tbody_block starts at its tbody_X line and goes up to (but not
-      including) the next tbody_X line, or EOF for the last block.
+    - 'header' is everything before the first <tbody_…> tag.
+    - Each tbody_block starts at its own <tbody_X> (inclusive) and
+      ends at the matching </tbody_X> (inclusive). If the closing tag
+      is missing, it goes up to the next <tbody_…> or EOF.
 
-    If no tbody line is found, returns (None, None).
+    If no tbody tag is found, returns (None, None).
     """
     matches = list(TBODY_OPEN_RE.finditer(text))
     if not matches:
@@ -35,15 +31,35 @@ def split_by_tbody(text: str):
     blocks = []
 
     for i, m in enumerate(matches):
+        tbody_id = m.group(1)  # e.g. "1", "1.1", "1.1.1"
         start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+
+        # matching closing tag: </tbody_1.1.1>
+        close_pat = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
+                               re.IGNORECASE)
+        close_match = close_pat.search(text, m.end())
+
+        if close_match:
+            end = close_match.end()
+        else:
+            # no closing tag: go until next opening tag or EOF
+            if i + 1 < len(matches):
+                end = matches[i + 1].start()
+            else:
+                end = len(text)
+
         blocks.append(text[start:end])
+
+    # Attach any trailing text after the last tbody block
+    last_end = end
+    if last_end < len(text):
+        blocks[-1] += text[last_end:]
 
     return header, blocks
 
 
 def process_file(src_path: Path, dst_dir: Path) -> None:
-    """Process a single .txt file."""
+    """Process a single .txt file: split on tbody blocks or copy unchanged."""
     text = src_path.read_text(encoding="utf-8", errors="replace")
 
     header, blocks = split_by_tbody(text)
@@ -63,7 +79,8 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Split .txt files on tbody_X blocks or copy unchanged."
+        description="Split .txt files on <tbody_X>...</tbody_X> blocks "
+                    "or copy unchanged."
     )
     parser.add_argument("input_dir", help="Folder containing .txt files")
     parser.add_argument("output_dir", help="Folder for output files")
