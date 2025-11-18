@@ -6,24 +6,65 @@ import shutil
 
 from tqdm import tqdm
 
+# <tbody_1.1>   <tbody_2.3> etc.
+TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
+
+
+def split_by_tbody(text: str):
+    """
+    Return (header, [tbody_block1, tbody_block2, ...]).
+    Each tbody_block includes its own opening and closing tbody tags.
+    If no tbody is found, returns (None, None).
+    """
+    first = TBODY_OPEN_RE.search(text)
+    if not first:
+        return None, None  # no tbody at all
+
+    header = text[: first.start()]
+    blocks = []
+    pos = first.start()
+
+    while True:
+        m = TBODY_OPEN_RE.search(text, pos)
+        if not m:
+            break
+
+        start = m.start()
+        tbody_id = m.group(1)  # e.g. "1.1"
+
+        # Find matching closing tag: </tbody_1.1>
+        close_pattern = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
+                                   re.IGNORECASE)
+        close_match = close_pattern.search(text, m.end())
+        if close_match:
+            end = close_match.end()
+        else:
+            # If no closing tag is found, take the rest of the file
+            end = len(text)
+
+        blocks.append(text[start:end])
+        pos = end
+
+    # Any trailing text after the last tbody stays after the last block
+    if blocks:
+        trailing = text[pos:]
+        blocks[-1] += trailing
+
+    return header, blocks
+
 
 def process_file(src_path: Path, dst_dir: Path) -> None:
-    """Process a single .txt file."""
     text = src_path.read_text(encoding="utf-8")
 
-    # Split at every "<tbody" while keeping "<tbody..." at the start of each block
-    parts = re.split(r'(?i)(?=<tbody)', text)  # (?i) = case-insensitive
+    header, blocks = split_by_tbody(text)
 
-    if len(parts) <= 1:
-        # No <tbody...> → simply copy file
+    # No tbody → simple copy
+    if header is None or not blocks:
         dst_path = dst_dir / src_path.name
         shutil.copy2(src_path, dst_path)
         return
 
-    header = parts[0]
-    tbody_blocks = parts[1:]
-
-    for i, block in enumerate(tbody_blocks, start=1):
+    for i, block in enumerate(blocks, start=1):
         out_name = f"{src_path.stem}_part{i}{src_path.suffix}"
         out_path = dst_dir / out_name
         out_path.write_text(header + block, encoding="utf-8")
@@ -31,10 +72,13 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Split .txt files on <tbody...> or copy unchanged if none found."
+        description=(
+            "Split .txt files on complete <tbody_x.y>...</tbody_x.y> blocks "
+            "or copy unchanged if none found."
+        )
     )
-    parser.add_argument("input_dir", help="Folder containing .txt files to process")
-    parser.add_argument("output_dir", help="Folder where output files will be written")
+    parser.add_argument("input_dir", help="Folder containing .txt files")
+    parser.add_argument("output_dir", help="Folder where output files go")
 
     args = parser.parse_args()
 
