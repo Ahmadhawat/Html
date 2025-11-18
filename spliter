@@ -6,64 +6,55 @@ import shutil
 
 from tqdm import tqdm
 
-# <tbody_1.1>   <tbody_2.3> etc.
-TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
+# Match lines like:
+#   tbody_1
+#   <tbody_1>
+#   tbody_1.1
+#   <tbody_1.1>
+# with arbitrary spaces/tabs around them.
+TBODY_OPEN_RE = re.compile(
+    r"(?mi)^[^\S\r\n]*<?tbody_([0-9.]+)>?[^\S\r\n]*$"
+)
 
 
 def split_by_tbody(text: str):
     """
     Return (header, [tbody_block1, tbody_block2, ...]).
-    Each tbody_block includes its own opening and closing tbody tags.
-    If no tbody is found, returns (None, None).
+
+    - 'header' is everything before the first tbody line.
+    - Each tbody_block starts at its tbody_X line and goes up to (but not
+      including) the next tbody_X line, or EOF for the last block.
+
+    If no tbody line is found, returns (None, None).
     """
-    first = TBODY_OPEN_RE.search(text)
-    if not first:
-        return None, None  # no tbody at all
+    matches = list(TBODY_OPEN_RE.finditer(text))
+    if not matches:
+        return None, None
 
-    header = text[: first.start()]
+    header = text[:matches[0].start()]
     blocks = []
-    pos = first.start()
 
-    while True:
-        m = TBODY_OPEN_RE.search(text, pos)
-        if not m:
-            break
-
+    for i, m in enumerate(matches):
         start = m.start()
-        tbody_id = m.group(1)  # e.g. "1.1"
-
-        # Find matching closing tag: </tbody_1.1>
-        close_pattern = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
-                                   re.IGNORECASE)
-        close_match = close_pattern.search(text, m.end())
-        if close_match:
-            end = close_match.end()
-        else:
-            # If no closing tag is found, take the rest of the file
-            end = len(text)
-
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
         blocks.append(text[start:end])
-        pos = end
-
-    # Any trailing text after the last tbody stays after the last block
-    if blocks:
-        trailing = text[pos:]
-        blocks[-1] += trailing
 
     return header, blocks
 
 
 def process_file(src_path: Path, dst_dir: Path) -> None:
-    text = src_path.read_text(encoding="utf-8")
+    """Process a single .txt file."""
+    text = src_path.read_text(encoding="utf-8", errors="replace")
 
     header, blocks = split_by_tbody(text)
 
-    # No tbody → simple copy
+    # No tbody markers: copy unchanged
     if header is None or not blocks:
         dst_path = dst_dir / src_path.name
         shutil.copy2(src_path, dst_path)
         return
 
+    # One output file per tbody block
     for i, block in enumerate(blocks, start=1):
         out_name = f"{src_path.stem}_part{i}{src_path.suffix}"
         out_path = dst_dir / out_name
@@ -72,14 +63,10 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Split .txt files on complete <tbody_x.y>...</tbody_x.y> blocks "
-            "or copy unchanged if none found."
-        )
+        description="Split .txt files on tbody_X blocks or copy unchanged."
     )
     parser.add_argument("input_dir", help="Folder containing .txt files")
-    parser.add_argument("output_dir", help="Folder where output files go")
-
+    parser.add_argument("output_dir", help="Folder for output files")
     args = parser.parse_args()
 
     in_dir = Path(args.input_dir)
@@ -88,8 +75,8 @@ def main():
 
     txt_files = [p for p in in_dir.glob("*.txt") if p.is_file()]
 
-    for path in tqdm(txt_files, desc="Processing .txt files"):
-        process_file(path, out_dir)
+    for src in tqdm(txt_files, desc="Processing .txt files"):
+        process_file(src, out_dir)
 
 
 if __name__ == "__main__":
