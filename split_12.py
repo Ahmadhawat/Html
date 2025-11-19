@@ -6,8 +6,18 @@ from typing import List
 
 import shutil
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
-WORD_LIMIT = 300
+# ---------- CONFIG ----------
+
+# Max tokens per final file (approximate, using embedding tokenizer)
+TOKEN_LIMIT = 450
+
+# Embedding / tokenizer model
+MODEL_NAME = "intfloat/multilingual-e5-base"
+
+# Load tokenizer once (same as you use for embeddings)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
 
 # tbody open tag anywhere in text, e.g. <tbody_1>, <tbody_1.1>, ...
 TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
@@ -17,7 +27,25 @@ TR_OPEN_RE = re.compile(r"<tr_[^>]*>", re.IGNORECASE)
 A_TAG_RE = re.compile(r"<a\b[^>]*>.*?</a>", re.IGNORECASE | re.DOTALL)
 
 
-# ---------- Step 1: tbody detection and base/part building ----------
+# ---------- Token counting ----------
+
+def count_tokens(text: str) -> int:
+    """
+    Count tokens using the multilingual-e5-base tokenizer.
+
+    NOTE: we don't add "query:" / "passage:" prefixes here; if you
+    will always embed with a prefix, you can optionally add it here.
+    """
+    # Set add_special_tokens=True so this matches embedding-time length.
+    ids = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=False
+    )["input_ids"]
+    return len(ids)
+
+
+# ---------- Step 1: tbody detection ----------
 
 def find_leaf_tbody_blocks(text: str):
     """
@@ -62,12 +90,7 @@ def find_leaf_tbody_blocks(text: str):
     return leaf_blocks
 
 
-# ---------- Step 2: <tr_...> and word-based splitting ----------
-
-def count_words(text: str) -> int:
-    """Rough word count: number of alphanumeric tokens."""
-    return len(re.findall(r"\w+", text, flags=re.UNICODE))
-
+# ---------- Step 2: <tr_...> splitting based on tokens ----------
 
 def split_tr_blocks(inner: str) -> List[str]:
     """
@@ -92,7 +115,7 @@ def split_part_on_tr(text: str) -> List[str]:
     """
     Given a *part* file text (first two lines + maybe <a> + one tbody),
     split it further on <tr_...> so each resulting text has at most
-    WORD_LIMIT words if possible, or at least one <tr> per file.
+    TOKEN_LIMIT tokens if possible, or at least one <tr> per file.
 
     Always returns *at least one* version (never None).
     """
@@ -101,8 +124,8 @@ def split_part_on_tr(text: str) -> List[str]:
     if not m_open:
         return [text]
 
-    total_words = count_words(text)
-    if total_words <= WORD_LIMIT:
+    total_tokens = count_tokens(text)
+    if total_tokens <= TOKEN_LIMIT:
         # Already small enough
         return [text]
 
@@ -131,41 +154,41 @@ def split_part_on_tr(text: str) -> List[str]:
     if len(tr_blocks) <= 1:
         return [text]
 
-    # Words contributed by everything except the rows themselves
+    # Tokens contributed by everything except the rows themselves
     constant_part = prefix + open_tag + close_tag + suffix
-    constant_words = count_words(constant_part)
-    allowed_for_rows = WORD_LIMIT - constant_words
+    constant_tokens = count_tokens(constant_part)
+    allowed_for_rows = TOKEN_LIMIT - constant_tokens
 
     chunks: List[List[str]] = []
 
     if allowed_for_rows <= 0:
-        # Even without any <tr>, we already exceed the word limit.
+        # Even without any <tr>, we already exceed the token limit.
         # We still split by <tr>, but force exactly one <tr> per file.
         for block in tr_blocks:
             chunks.append([block])
     else:
         # Normal case: pack <tr> blocks into chunks under the limit when possible
         current_chunk: List[str] = []
-        current_words = 0
+        current_tokens = 0
 
         for block in tr_blocks:
-            block_words = count_words(block)
+            block_tokens = count_tokens(block)
 
             if not current_chunk:
                 # Always start a chunk with at least one row, even if large
                 current_chunk.append(block)
-                current_words = block_words
+                current_tokens = block_tokens
                 continue
 
             # If adding this row would exceed the limit and we already have
             # at least one row in the chunk, start a new chunk.
-            if current_words + block_words > allowed_for_rows:
+            if current_tokens + block_tokens > allowed_for_rows:
                 chunks.append(current_chunk)
                 current_chunk = [block]
-                current_words = block_words
+                current_tokens = block_tokens
             else:
                 current_chunk.append(block)
-                current_words += block_words
+                current_tokens += block_tokens
 
         if current_chunk:
             chunks.append(current_chunk)
@@ -201,8 +224,8 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
                 first two lines
                 + all <a>...</a> between first two lines and that tbody
                 + that tbody block
-            - Then apply <tr_...> + word-based splitting (<= WORD_LIMIT
-              words if possible, or at least one <tr> per file).
+            - Then apply <tr_...> + token-based splitting
+              (<= TOKEN_LIMIT tokens if possible, or at least one <tr> per file).
             - Write resulting files:
                 * if only one version: <stem>_part{i}.txt
                 * if several versions: <stem>_part{i}_s{j}.txt
@@ -250,7 +273,7 @@ def process_file(src_path: Path, dst_dir: Path) -> None:
 
         part_text = first_two + a_text + tbody_text
 
-        # Now apply the WORD_LIMIT + <tr_...> logic
+        # Now apply the TOKEN_LIMIT + <tr_...> logic
         versions = split_part_on_tr(part_text)
 
         if len(versions) == 1:
@@ -271,8 +294,9 @@ def main():
             "   - one *_base.txt with placeholders __TBODY_PART_n__,\n"
             "   - one or more *_partN*.txt files per tbody, containing\n"
             "     the first two lines + any <a>...</a> before that tbody + the tbody.\n"
-            "2) Further split each part on <tr_...> rows so that each final file\n"
-            "   has at most 300 words when possible, or at least one <tr> per file.\n"
+            "2) Further split each part on <tr_...> rows using the "
+            "intfloat/multilingual-e5-base tokenizer so that each final file\n"
+            "   has at most ~450 tokens when possible, or at least one <tr> per file.\n"
             "Files without tbody are copied unchanged to the output folder."
         )
     )
