@@ -1,55 +1,46 @@
 #!/usr/bin/env python
 import argparse
+import bisect
 import re
 from pathlib import Path
 import shutil
 
 from tqdm import tqdm
 
-# Opening tag can be anywhere in a line, e.g.
-#   <tbody_1>
-#   ... <tbody_1.1> ...
+# Opening tag anywhere in a line, e.g. "<tbody_1>", "<tbody_1.1>", ...
 TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
 
 
-def split_by_tbody(text: str):
+def find_leaf_tbody_blocks(text: str):
     """
-    Return (header, [tbody_block1, tbody_block2, ...]).
+    Find all <tbody_X>...</tbody_X> ranges and return only the *leaf* ones.
 
-    - 'header' is everything before the first <tbody_…> tag.
-    - We detect ALL <tbody_X>…</tbody_X> ranges.
-    - We then keep only the *leaf* ranges, i.e. those that do not
-      contain another <tbody_…> start inside them.
-    - Each returned block starts at its own <tbody_X> and ends at its
-      own </tbody_X>, inclusive.
+    Returns a list of dicts: {"id": str, "start": int, "end": int},
+    sorted by "start".
 
-    If no tbody tag is found, returns (None, None).
+    Leaf = a tbody range that does NOT contain the start of another tbody.
     """
     open_matches = list(TBODY_OPEN_RE.finditer(text))
     if not open_matches:
-        return None, None
+        return []
 
-    header = text[:open_matches[0].start()]
-
-    # First, build all blocks (they may be nested / overlapping)
-    blocks = []  # each: dict(id, start, end)
+    blocks = []
     for m in open_matches:
-        tbody_id = m.group(1)          # e.g. "1", "1.1", "1.1.1"
+        tbody_id = m.group(1)  # e.g. "1", "1.1", "1.1.1"
         start = m.start()
 
-        # Find matching closing tag: </tbody_X>
+        # closing tag: </tbody_X>
         close_pat = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
                                re.IGNORECASE)
         close_match = close_pat.search(text, m.end())
         if close_match:
             end = close_match.end()
         else:
-            # If no closing tag is found, go to EOF
             end = len(text)
 
         blocks.append({"id": tbody_id, "start": start, "end": end})
 
-    # Keep only leaf blocks (no other block starts inside them)
+    # keep only leaf blocks (no other block starts inside)
     leaf_blocks = []
     for i, b in enumerate(blocks):
         has_child = any(
@@ -59,38 +50,108 @@ def split_by_tbody(text: str):
         if not has_child:
             leaf_blocks.append(b)
 
-    # Sort by position in file
     leaf_blocks.sort(key=lambda b: b["start"])
+    return leaf_blocks
 
-    # Convert to text slices
-    block_texts = [text[b["start"]:b["end"]] for b in leaf_blocks]
 
-    return header, block_texts
+def build_line_index(text: str):
+    """
+    Return (lines, line_starts).
+
+    lines: list of lines with keepends=True
+    line_starts: list of starting character index of each line in 'text'
+    """
+    lines = text.splitlines(keepends=True)
+    line_starts = []
+    pos = 0
+    for line in lines:
+        line_starts.append(pos)
+        pos += len(line)
+    return lines, line_starts
+
+
+def get_context_before_block(block_start: int, lines, line_starts,
+                             max_lines: int = 3):
+    """
+    Get up to 'max_lines' non-empty lines immediately before the block,
+    stopping at a blank line.
+
+    Returns a string.
+    """
+    # find line index for block_start
+    line_idx = bisect.bisect_right(line_starts, block_start) - 1
+    ctx_lines = []
+    j = line_idx - 1
+
+    count = 0
+    while j >= 0 and count < max_lines:
+        if lines[j].strip() == "":
+            # stop at blank line to not cross paragraphs/sections
+            break
+        ctx_lines.insert(0, lines[j])
+        count += 1
+        j -= 1
+
+    return "".join(ctx_lines)
 
 
 def process_file(src_path: Path, dst_dir: Path) -> None:
-    """Process a single .txt file: split on tbody blocks or copy unchanged."""
+    """
+    For each source .txt file:
+
+    - Create <stem>_base.txt with the full text but with each leaf tbody
+      replaced by a placeholder "__TBODY_PART_n__".
+    - For each leaf tbody block, create <stem>_partN.txt containing:
+        * first two lines of the file
+        * small context just before the tbody
+        * tbody block itself
+    """
     text = src_path.read_text(encoding="utf-8", errors="replace")
+    blocks = find_leaf_tbody_blocks(text)
 
-    header, blocks = split_by_tbody(text)
-
-    # No tbody markers: copy unchanged
-    if header is None or not blocks:
+    # If no tbody markers: just copy unchanged
+    if not blocks:
         dst_path = dst_dir / src_path.name
         shutil.copy2(src_path, dst_path)
         return
 
-    # One output file per tbody block
-    for i, block in enumerate(blocks, start=1):
-        out_name = f"{src_path.stem}_part{i}{src_path.suffix}"
+    # Build line index and get first two lines
+    lines, line_starts = build_line_index(text)
+    first_two = "".join(lines[:2]) if len(lines) >= 2 else "".join(lines)
+
+    # ---- Create base file (everything except tbody content) ----
+    segments = []
+    last = 0
+    for idx, b in enumerate(blocks, start=1):
+        segments.append(text[last:b["start"]])
+        segments.append(f"__TBODY_PART_{idx}__\n")  # placeholder
+        last = b["end"]
+    segments.append(text[last:])
+    base_text = "".join(segments)
+
+    base_name = f"{src_path.stem}_base{src_path.suffix}"
+    (dst_dir / base_name).write_text(base_text, encoding="utf-8")
+
+    # ---- Create one part file per tbody block ----
+    for idx, b in enumerate(blocks, start=1):
+        context = get_context_before_block(b["start"], lines, line_starts,
+                                           max_lines=3)
+        tbody_text = text[b["start"]:b["end"]]
+
+        part_content = first_two + context + tbody_text
+
+        out_name = f"{src_path.stem}_part{idx}{src_path.suffix}"
         out_path = dst_dir / out_name
-        out_path.write_text(header + block, encoding="utf-8")
+        out_path.write_text(part_content, encoding="utf-8")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Split .txt files so each output has exactly one "
-                    "<tbody_X>...</tbody_X> block."
+        description=(
+            "Split .txt files on <tbody_X>...</tbody_X> so that:\n"
+            "- one *_base.txt file keeps all non-tbody text (with placeholders),\n"
+            "- each *_partN.txt contains first two lines + local context + one tbody."
+        )
     )
     parser.add_argument("input_dir", help="Folder containing .txt files")
     parser.add_argument("output_dir", help="Folder for output files")
