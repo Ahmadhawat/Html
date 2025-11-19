@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+import argparse
+import re
+from pathlib import Path
+from typing import List
+
+import shutil
+from tqdm import tqdm
+
+WORD_LIMIT = 300
+
+# tbody open tag anywhere in text, e.g. <tbody_1>, <tbody_1.1>, ...
+TBODY_OPEN_RE = re.compile(r"<tbody_([0-9.]+)>", re.IGNORECASE)
+# tr open tag, e.g. <tr_1,1,1> , <tr_1.2> ...
+TR_OPEN_RE = re.compile(r"<tr_[^>]*>", re.IGNORECASE)
+
+
+def count_words(text: str) -> int:
+    """Rough word count: number of alphanumeric tokens."""
+    return len(re.findall(r"\w+", text, flags=re.UNICODE))
+
+
+def split_tr_blocks(inner: str) -> List[str]:
+    """
+    Split tbody inner content into blocks per <tr_...>.
+
+    Each block runs from its <tr_...> tag up to (but not including)
+    the next <tr_...>, or to the end of 'inner'.
+    """
+    matches = list(TR_OPEN_RE.finditer(inner))
+    if not matches:
+        return [inner] if inner.strip() else []
+
+    blocks = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(inner)
+        blocks.append(inner[start:end])
+    return blocks
+
+
+def split_file_content(text: str) -> List[str] | None:
+    """
+    Try to split one file into several variants.
+
+    Returns a list of full file texts (each a new file content),
+    or None if the file should not be split.
+    """
+    # Only handle files with a tbody
+    m_open = TBODY_OPEN_RE.search(text)
+    if not m_open:
+        return None
+
+    total_words = count_words(text)
+    if total_words <= WORD_LIMIT:
+        # Small enough already
+        return None
+
+    tbody_id = m_open.group(1)
+    open_start, open_end = m_open.span()
+
+    # Find matching closing tag </tbody_X>
+    close_pat = re.compile(r"</tbody_" + re.escape(tbody_id) + r">",
+                           re.IGNORECASE)
+    m_close = close_pat.search(text, open_end)
+    if not m_close:
+        # Malformed: do not try to split
+        return None
+
+    close_start, close_end = m_close.span()
+
+    prefix = text[:open_start]
+    open_tag = text[open_start:open_end]
+    inner = text[open_end:close_start]
+    close_tag = text[close_start:close_end]
+    suffix = text[close_end:]
+
+    tr_blocks = split_tr_blocks(inner)
+
+    # If there are 0 or 1 <tr> blocks, there is nothing useful to split
+    if len(tr_blocks) <= 1:
+        return None
+
+    # Words contributed by everything except the rows themselves
+    constant_part = prefix + open_tag + close_tag + suffix
+    constant_words = count_words(constant_part)
+    allowed_for_rows = WORD_LIMIT - constant_words
+
+    chunks: List[List[str]] = []
+
+    if allowed_for_rows <= 0:
+        # Even without any <tr>, we already exceed the word limit.
+        # We still split by <tr>, but force exactly one <tr> per file.
+        for block in tr_blocks:
+            chunks.append([block])
+    else:
+        # Normal case: pack <tr> blocks into chunks under the limit when possible
+        current_chunk: List[str] = []
+        current_words = 0
+
+        for block in tr_blocks:
+            block_words = count_words(block)
+
+            if not current_chunk:
+                # Always start a chunk with at least one row, even if large
+                current_chunk.append(block)
+                current_words = block_words
+                continue
+
+            # If adding this row would exceed the limit and we already have
+            # at least one row in the chunk, start a new chunk.
+            if current_words + block_words > allowed_for_rows:
+                chunks.append(current_chunk)
+                current_chunk = [block]
+                current_words = block_words
+            else:
+                current_chunk.append(block)
+                current_words += block_words
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+    # If after all of this we still only have one chunk, splitting didn't
+    # create multiple files, so we keep the original.
+    if len(chunks) <= 1:
+        return None
+
+    # Build the full file texts for each chunk
+    new_texts: List[str] = []
+    for chunk in chunks:
+        inner_chunk = "".join(chunk)
+        new_text = prefix + open_tag + inner_chunk + close_tag + suffix
+        new_texts.append(new_text)
+
+    return new_texts
+
+
+def process_file(src_path: Path, out_dir: Path) -> None:
+    text = src_path.read_text(encoding="utf-8", errors="replace")
+
+    new_versions = split_file_content(text)
+
+    if not new_versions:
+        # Cannot or should not split -> copy original file to output folder
+        dst_path = out_dir / src_path.name
+        shutil.copy2(src_path, dst_path)
+        return
+
+    # Write split versions
+    for idx, content in enumerate(new_versions, start=1):
+        out_name = f"{src_path.stem}_s{idx}{src_path.suffix}"
+        out_path = out_dir / out_name
+        out_path.write_text(content, encoding="utf-8")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Further split .txt files with <tbody_...> blocks based on <tr_...> "
+            "rows so each new file has <= 300 words when possible, or at least "
+            "one <tr> per file. All results (including unsplittable files) are "
+            "written to a new output folder; originals are untouched."
+        )
+    )
+    parser.add_argument("input_dir", help="Folder containing .txt files")
+    parser.add_argument("output_dir", help="Folder to write new/split files")
+    args = parser.parse_args()
+
+    in_dir = Path(args.input_dir)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    txt_files = [p for p in in_dir.glob("*.txt") if p.is_file()]
+
+    for src in tqdm(txt_files, desc="Splitting long tbody files"):
+        process_file(src, out_dir)
+
+
+if __name__ == "__main__":
+    main()
